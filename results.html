@@ -1,0 +1,436 @@
+<!-- ===== RESULTS UI ===== -->
+
+<style>
+.result-badge{
+  display:inline-block;
+  padding:.1rem .4rem;
+  border-radius:999px;
+  font-size:.75rem;
+}
+.badge-pending{background:#fff3cd;color:#856404;border:1px solid #ffeeba}
+.badge-complete{background:#e6ffed;color:#046b1a;border:1px solid #b7f5c4}
+
+.result-grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:8px;
+  margin-top:4px;
+}
+
+.result-card{
+  border:1px solid #e5e7eb;
+  border-radius:8px;
+  padding:6px 8px;
+}
+
+.result-card h4{
+  margin:.15rem 0 .3rem;
+  font-size:.95rem;
+}
+
+.result-list{
+  margin:0;
+  padding-left:16px;
+}
+
+.kv{
+  display:grid;
+  grid-template-columns:160px 1fr;
+  gap:4px;
+  margin:.15rem 0;
+}
+
+.kv b{
+  color:#374151;
+  font-weight:600;
+}
+
+.mono{
+  font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+}
+
+.smallmuted{
+  color:#6b7280;
+  font-size:.8rem;
+  margin:.15rem 0;
+}
+
+.actions{
+  display:flex;
+  gap:.25rem;
+  margin-top:6px;
+}
+
+button.btn{
+  border:1px solid #d1d5db;
+  background:#fff;
+  border-radius:6px;
+  padding:4px 8px;
+  cursor:pointer;
+  font-size:.85rem;
+}
+
+pre.pretty{
+  background:#f9fafb;
+  border:1px solid #e5e7eb;
+  border-radius:6px;
+  padding:6px;
+  max-height:260px;
+  overflow:auto;
+  margin:.25rem 0;
+  font-size:.85rem;
+  line-height:1.3;
+}
+
+@media (max-width:800px){
+  .result-grid{grid-template-columns:1fr}
+}
+</style>
+
+
+<section id="results" style="margin:2rem 0;">
+  <h2>Results</h2>
+  <p id="results-status">Upload your spreadsheets to begin. No job running.</p>
+  <div id="results-body" style="border:1px solid #ddd;padding:1rem;border-radius:8px;min-height:120px;white-space:pre-wrap;"></div>
+
+  <!-- Optional manual starter for testing -->
+  <div style="margin-top:1rem;display:flex;gap:.5rem;align-items:center;">
+    <input id="manual-jobid" type="text" placeholder="Enter job_id to test polling…" style="flex:1;padding:.5rem;">
+    <button id="manual-start" type="button" style="padding:.5rem 1rem;">Start Polling</button>
+  </div>
+</section>
+
+<script>
+/* -------------------- STATE -------------------- */
+let jobId = null;
+let pollTimer = null;
+let pollDeadline = null;
+let isPolling = false;
+
+/* -------------------- CONFIG -------------------- */
+const RESULTS_API_BASE = 'https://makermind.app.n8n.cloud/webhook/validata/results';
+const ALLOWED_MESSAGE_ORIGINS = Object.freeze([
+  window.location.origin,
+]);
+
+/* -------------------- HELPERS -------------------- */
+function $(id){ return document.getElementById(id); }
+function renderStatus(msg){ const el = $('results-status'); if (el) el.textContent = msg; }
+function plural(n, s){ return `${n} ${s}${n===1?'':'s'}`; }
+function text(v){ return (v===null||v===undefined)?'—':String(v); }
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m])); }
+
+function summarizeResults(payload){
+  const res = payload?.results ?? payload;
+  const summary = { tasks:0, parts:0, errors:0, warnings:0, infos:0 };
+  const excel = payload?.excel;
+  if (excel) {
+    summary.errors   += (excel.errors?.length || 0);
+    summary.warnings += (excel.warnings?.length || 0);
+    summary.infos    += (excel.info?.length || 0);
+  }
+  const websiteSummary = payload?.websiteSummary;
+  if (websiteSummary) {
+    summary.errors   += (websiteSummary.totalErrors || 0);
+    summary.warnings += (websiteSummary.totalWarnings || 0);
+    summary.infos    += (websiteSummary.totalInfo || 0);
+    if (websiteSummary.maintenance?.totalRows) summary.tasks += websiteSummary.maintenance.totalRows;
+    if (websiteSummary.spares?.totalRows)      summary.parts += websiteSummary.spares.totalRows;
+  }
+  const scan = (obj)=>{
+    if (!obj || typeof obj!=='object') return;
+    Object.entries(obj).forEach(([k,v])=>{
+      if (Array.isArray(v)) {
+        if (/error/i.test(k))   summary.errors+=v.length;
+        if (/warn/i.test(k))    summary.warnings+=v.length;
+        if (/info/i.test(k))    summary.infos+=v.length;
+      } else if (v && typeof v==='object') scan(v);
+    });
+  };
+  scan(res);
+  return summary;
+}
+
+function sectionHTML(title, bodyHTML){
+  return `<div class="result-card"><h4>${title}</h4>${bodyHTML}</div>`;
+}
+function listHTML(items, mapFn){
+  if (!Array.isArray(items) || items.length===0) return '<p class="smallmuted">None</p>';
+  return `<ol class="result-list">${items.map((it)=>`<li>${mapFn(it)}</li>`).join('')}</ol>`;
+}
+async function copyToClipboard(textToCopy){
+  try {
+    await navigator.clipboard.writeText(textToCopy);
+    alert('Raw JSON copied to clipboard.');
+  } catch (e) {
+    console.error('Copy failed:', e);
+    alert('Copy failed.');
+  }
+}
+
+function renderResultsPayload(payload){
+  const out = document.getElementById('results-body');
+  if (!out) return;
+
+  // --- Normalize + fallbacks ---
+  const job = payload.job_id || payload?.results?.job_id || 'unknown';
+  // Treat as complete if we clearly have results, even if status missing
+  const rawStatus = (payload.status || (payload.ok===true ? 'complete' : ''));
+  const hasAnyResults =
+    (Array.isArray(payload.results) && payload.results.length > 0) ||
+    (payload.results && typeof payload.results === 'object' && Object.keys(payload.results).length > 0) ||
+    !!payload.websiteSummary || !!payload.excel || !!payload.ai;
+
+  const status = String(rawStatus || (hasAnyResults ? 'complete' : 'pending')).toLowerCase();
+  const badge = status==='complete'
+    ? `<span class="result-badge badge-complete">complete</span>`
+    : `<span class="result-badge badge-pending">pending</span>`;
+
+  // Known sections
+  const ws = payload.websiteSummary || {};
+  const excel = payload.excel || null;
+  const aiRaw = payload.ai || null;
+  const meta = payload.metadata || null;
+
+  // --- Smart fallbacks for row counts ---
+  const maint = ws.maintenance || {};
+  const spares = ws.spares || {};
+  const cross  = ws.crossReference || {};
+
+  const maintRows =
+    maint.totalRows ??
+    maint.rows ??
+    maint.count ??
+    (Array.isArray(maint.errors) ? maint.errors.length : undefined);
+
+  const sparesRows =
+    spares.totalRows ??
+    spares.rows ??
+    spares.count ??
+    (Array.isArray(spares.errors) ? spares.errors.length : undefined);
+
+  // --- Summary counts (merge multiple shapes) ---
+  const summaryCounts = summarizeResults(payload);
+
+  // --- Build header ---
+  const header = `
+    <div class="kv"><b>Job ID</b><span class="mono">${job}</span></div>
+    <div class="kv"><b>Status</b>${badge}</div>
+    <div class="kv"><b>Summary</b>
+      <span>${summaryCounts.errors} errors · ${summaryCounts.warnings} warnings · ${summaryCounts.infos} infos</span>
+    </div>
+  `;
+
+  // --- Cards ---
+  const sections = [];
+
+  // Document summary card
+  if (Object.keys(ws).length > 0) {
+    const body = `
+      <div class="kv"><b>Overall</b><span>${(ws.overallStatus || ws.status || '—')}</span></div>
+      <div class="kv"><b>Maintenance rows</b><span>${maintRows ?? '—'}</span></div>
+      <div class="kv"><b>Spares rows</b><span>${sparesRows ?? '—'}</span></div>
+      <div class="kv"><b>Checked tasks</b><span>${cross.taskValidation?.totalChecked ?? '—'}</span></div>
+      <div class="kv"><b>Checked parts</b><span>${cross.partValidation?.totalChecked ?? '—'}</span></div>
+    `;
+    sections.push(sectionHTML('Document Summary', body));
+  }
+
+  // Spreadsheet validation card
+  if (excel) {
+    const errors = excel.errors || [];
+    const warnings = excel.warnings || [];
+    const info = excel.info || [];
+
+    const body = `
+      <b>Errors</b>
+      ${listHTML(errors, (e)=> escapeHtml(e.issue || e.message || JSON.stringify(e)))}
+      <b>Warnings</b>
+      ${listHTML(warnings, (w)=> escapeHtml(w.issue || w.message || JSON.stringify(w)))}
+      <b>Info</b>
+      ${listHTML(info, (i)=> escapeHtml(i.issue || i.message || JSON.stringify(i)))}
+    `;
+    sections.push(sectionHTML('Spreadsheet Validation', body));
+  }
+
+  // AI notes card (array or string/object)
+  if (aiRaw !== null && aiRaw !== undefined) {
+    let aiHtml = '';
+    if (Array.isArray(aiRaw)) {
+      // Common shape: [{ output: "..." }, ...]
+      const joined = aiRaw
+        .map(item => (typeof item === 'string' ? item : (item.output || JSON.stringify(item))))
+        .join('\n\n');
+      aiHtml = `<div class="smallmuted">AI analysis</div>
+        <pre class="pretty mono">${escapeHtml(joined)}</pre>`;
+    } else if (typeof aiRaw === 'string') {
+      aiHtml = `<div class="smallmuted">AI analysis</div>
+        <pre class="pretty mono">${escapeHtml(aiRaw)}</pre>`;
+    } else {
+      aiHtml = `<div class="smallmuted">AI analysis</div>
+        <pre class="pretty mono">${escapeHtml(JSON.stringify(aiRaw, null, 2))}</pre>`;
+    }
+    sections.push(sectionHTML('AI Notes', aiHtml));
+  }
+
+  // Metadata
+  if (meta) {
+    const body = `
+      <div class="kv"><b>Started</b><span>${text(meta.startedAt)}</span></div>
+      <div class="kv"><b>Finished</b><span>${text(meta.finishedAt)}</span></div>
+      <div class="kv"><b>Runtime</b><span>${text(meta.runtime)}</span></div>
+    `;
+    sections.push(sectionHTML('Execution Metadata', body));
+  }
+
+  // Fallback – show raw payload if nothing else showed
+  if (sections.length === 0) {
+    sections.push(sectionHTML('Results', `<pre class="pretty mono">${escapeHtml(JSON.stringify(payload, null, 2))}</pre>`));
+  }
+
+  // Actions
+  const actions = `
+    <div class="actions">
+      <button class="btn" onclick='copyToClipboard(${JSON.stringify(JSON.stringify(payload))})'>Copy JSON</button>
+      <button class="btn" onclick='(function(){
+        const blob = new Blob([JSON.stringify(${JSON.stringify(payload)}, null, 2)], {type:"application/json"});
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "validata-results-${job}.json";
+        document.body.appendChild(a); a.click(); a.remove();
+      })()'>Download JSON</button>
+    </div>
+  `;
+
+  out.innerHTML = `
+    <div class="result-card">
+      <h4>Validation Results</h4>
+      ${header}
+    </div>
+    <div class="result-grid">
+      ${sections.join('')}
+    </div>
+    ${actions}
+  `;
+}
+
+function clearPolling(){
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null;
+  pollDeadline = null;
+  isPolling = false;
+}
+
+async function fetchJsonSafely(url, options){
+  const res = await fetch(url, { cache: 'no-store', ...options });
+  const text = await res.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch {}
+  return { ok: res.ok, status: res.status, text, data };
+}
+
+/* -------------------- CORE -------------------- */
+function startPolling(receivedJobId){
+  if (!receivedJobId || typeof receivedJobId !== 'string') {
+    console.warn('startPolling called without a valid job_id:', receivedJobId);
+    return;
+  }
+  if (isPolling && receivedJobId === jobId) {
+    console.log('Already polling this job:', jobId);
+    return;
+  }
+
+  // ensure no previous interval is running BEFORE we flip the flags
+  clearPolling();
+
+  jobId = receivedJobId;
+  isPolling = true;
+  renderStatus(`Job detected: ${jobId} — polling for results…`);
+
+  // 5-minute deadline
+  pollDeadline = Date.now() + 5 * 60 * 1000;
+
+  pollTimer = setInterval(async () => {
+    if (Date.now() > pollDeadline) {
+      clearPolling();
+      renderStatus('No results found within 5 minutes.');
+      sessionStorage.removeItem('validation_job_id');
+      return;
+    }
+
+    try {
+      const url = `${RESULTS_API_BASE}?job_id=${encodeURIComponent(jobId)}&t=${Date.now()}`;
+      const { ok, status, data } = await fetchJsonSafely(url, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' }
+      });
+
+      console.log('Polling response:', { ok, status, data });
+
+      if (!ok || !data || data.job_id !== jobId) return;
+
+      const statusStr = String(data.status || '').toLowerCase();
+      const isComplete = statusStr === 'complete' || data.ok === true;
+
+      const hasResultsArray = Array.isArray(data.results) && data.results.length > 0;
+      const hasResultsObj   = !!(data.results && typeof data.results === 'object' && !Array.isArray(data.results) && Object.keys(data.results).length > 0);
+
+      if (hasResultsArray || hasResultsObj) {
+        clearPolling();
+        renderStatus(`Results ready for ${jobId}.`);
+        renderResultsPayload(data);
+        sessionStorage.removeItem('validation_job_id');
+      } else if (isComplete) {
+        clearPolling();
+        renderStatus(`Results ready for ${jobId} (no issues reported).`);
+        renderResultsPayload(data);
+        sessionStorage.removeItem('validation_job_id');
+      }
+    } catch (err) {
+      console.error('Polling error:', err);
+    }
+  }, 3000);
+}
+
+/* -------------------- WIRING -------------------- */
+document.addEventListener('DOMContentLoaded', () => {
+  renderStatus('Upload your spreadsheets to begin. No job running.');
+
+  try {
+    sessionStorage.removeItem('validation_job_id');
+    const url = new URL(window.location.href);
+    if (url.searchParams.has('job_id')) {
+      url.searchParams.delete('job_id');
+      window.history.replaceState({}, '', url.toString());
+    }
+  } catch {}
+
+  window.addEventListener('message', (event) => {
+    if (!ALLOWED_MESSAGE_ORIGINS.includes(event.origin)) {
+      console.warn('Ignoring message from unexpected origin:', event.origin);
+      return;
+    }
+    if (event?.data?.type === 'validation_job' && event.data.job_id) {
+      console.log('Received fresh job_id via postMessage:', event.data.job_id);
+      sessionStorage.setItem('validation_job_id', event.data.job_id);
+      startPolling(event.data.job_id);
+    }
+  });
+
+  const btn = document.getElementById('manual-start');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      const entered = (document.getElementById('manual-jobid')?.value || '').trim();
+      if (!entered) {
+        renderStatus('Enter a job_id to start polling.');
+        return;
+      }
+      sessionStorage.setItem('validation_job_id', entered);
+      startPolling(entered);
+    });
+  }
+});
+
+/* -------------------- PUBLIC HOOK -------------------- */
+window.Validata = { startWithJob: (jid) => startPolling(jid) };
+</script>
