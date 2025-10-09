@@ -139,15 +139,45 @@ function summarizeResults(payload){
   return summary;
 }
 
+// Normalise payload -> a single "ws" object with maintenance/spares/oem etc.
+function getWS(payload){
+  // Prefer explicit websiteSummary
+  if (payload && payload.websiteSummary) return payload.websiteSummary;
+
+  // If results is an array, use the first element
+  if (Array.isArray(payload?.results) && payload.results.length) {
+    const first = payload.results[0];
+    // Some shapes nest websiteSummary again
+    return first.websiteSummary ? first.websiteSummary : first;
+  }
+
+  // If results is an object, use it
+  if (payload && payload.results && typeof payload.results === 'object' && !Array.isArray(payload.results)) {
+    return payload.results.websiteSummary ? payload.results.websiteSummary : payload.results;
+  }
+
+  // Fallback: payload itself
+  return payload || {};
+}
+
 /* -------------------- RULE UI HELPERS -------------------- */
+// Robustly collect all issues anywhere in the payload.
+// Looks in websiteSummary/results first, then falls back to a deep scan.
 function extractAllIssues(payload){
   const issues = [];
-  const ws = payload.websiteSummary || payload.results || {};
-  const buckets = [ws.maintenance, ws.spares, ws.oem, ws.crossReference?.taskValidation, ws.crossReference?.partValidation]
-    .filter(Boolean);
 
-  for (const bucket of buckets){
-    ['errors','warnings','info'].forEach(key => {
+  // 1) Prefer the normalised WS object if present
+  const ws = getWS(payload) || {};
+  const primaryBuckets = [
+    ws.maintenance,
+    ws.spares,
+    ws.oem,
+    ws.crossReference?.taskValidation,
+    ws.crossReference?.partValidation,
+  ].filter(Boolean);
+
+  for (const bucket of primaryBuckets){
+    for (const key of ['errors','warnings','info']){
       const arr = Array.isArray(bucket?.[key]) ? bucket[key] : [];
       for (const it of arr){
         issues.push({
@@ -160,22 +190,76 @@ function extractAllIssues(payload){
           suggestedFix: it.suggestedFix || ''
         });
       }
-    });
+    }
   }
 
-  const detailed = Array.isArray(ws.detailedErrors) ? ws.detailedErrors : [];
-  for (const it of detailed){
-    issues.push({
-      ruleId: it.ruleId || 'UNKNOWN_RULE',
-      severity: (it.severity || 'info').toUpperCase(),
-      sheet: it.sheet || '',
-      row: it.row ?? '',
-      column: it.column ?? '',
-      issue: it.issue || it.message || '',
-      suggestedFix: it.suggestedFix || ''
-    });
+  // detailedErrors at the same level as maintenance/spares
+  if (Array.isArray(ws.detailedErrors)) {
+    for (const it of ws.detailedErrors){
+      issues.push({
+        ruleId: it.ruleId || 'UNKNOWN_RULE',
+        severity: (it.severity || 'info').toUpperCase(),
+        sheet: it.sheet || '',
+        row: it.row ?? '',
+        column: it.column ?? '',
+        issue: it.issue || it.message || '',
+        suggestedFix: it.suggestedFix || ''
+      });
+    }
   }
 
+  // 2) If nothing found, do a deep scan over the entire payload.
+  if (issues.length === 0){
+    const seen = new WeakSet();
+    (function walk(node){
+      if (!node || typeof node !== 'object' || seen.has(node)) return;
+      seen.add(node);
+
+      // If this object looks like an issue, capture it.
+      const looksLikeIssue =
+        (typeof node.issue === 'string' || typeof node.message === 'string') &&
+        (node.ruleId || node.severity || node.sheet || node.row !== undefined || node.column !== undefined);
+
+      if (looksLikeIssue){
+        issues.push({
+          ruleId: node.ruleId || 'UNKNOWN_RULE',
+          severity: String(node.severity || 'info').toUpperCase(),
+          sheet: node.sheet || '',
+          row: node.row ?? '',
+          column: node.column ?? '',
+          issue: node.issue || node.message || '',
+          suggestedFix: node.suggestedFix || ''
+        });
+      }
+
+      // If this object has arrays called errors/warnings/info, pull those too.
+      for (const key of ['errors','warnings','info']){
+        if (Array.isArray(node[key])){
+          for (const it of node[key]){
+            if (it && typeof it === 'object'){
+              issues.push({
+                ruleId: it.ruleId || 'UNKNOWN_RULE',
+                severity: (it.severity || key || 'info').toUpperCase(),
+                sheet: it.sheet || node.sheet || '',
+                row: it.row ?? '',
+                column: it.column ?? '',
+                issue: it.issue || it.message || '',
+                suggestedFix: it.suggestedFix || ''
+              });
+            }
+          }
+        }
+      }
+
+      // Recurse
+      for (const v of Object.values(node)){
+        if (v && typeof v === 'object') walk(v);
+      }
+    })(payload);
+  }
+
+  // Debug log to confirm what we’re seeing (safe to leave or delete later)
+  console.log('extractAllIssues: found', issues.length, 'issues');
   return issues;
 }
 
@@ -267,15 +351,24 @@ function renderSummaryHeaderFromPayload(payload, context = {}){
   const header = document.getElementById('summary-header');
   if (!header) return;
 
-  const ws = payload.websiteSummary || payload.results || {};
+  const ws = getWS(payload) || {};
   const summary = ws.summary || {};
   const counts = context.summaryCounts || summarizeResults(payload);
+
   const overall = String(summary.overallStatus || ws.overallStatus || summary.status || '—').toUpperCase();
   const jobStatus = context.jobStatus || 'pending';
   const jobIdDisplay = context.jobId ? escapeHtml(context.jobId) : 'unknown';
   const timestamp = summary.timestamp || ws.timestamp || payload.timestamp || '';
-  const checkedTasks = summary.checkedTasks ?? summary.totalTasksChecked ?? ws.crossReference?.taskValidation?.totalChecked ?? null;
-  const checkedParts = summary.checkedParts ?? summary.totalPartsChecked ?? ws.crossReference?.partValidation?.totalChecked ?? null;
+
+  const checkedTasks = summary.checkedTasks
+    ?? summary.totalTasksChecked
+    ?? ws.crossReference?.taskValidation?.totalChecked
+    ?? null;
+
+  const checkedParts = summary.checkedParts
+    ?? summary.totalPartsChecked
+    ?? ws.crossReference?.partValidation?.totalChecked
+    ?? null;
 
   const statusBadge = overall === 'FAILED'
     ? '<span class="status-badge status-failed">FAILED</span>'
@@ -283,8 +376,9 @@ function renderSummaryHeaderFromPayload(payload, context = {}){
       ? '<span class="status-badge status-passed">PASSED</span>'
       : `<span class="status-badge status-neutral">${escapeHtml(overall)}</span>`;
 
-  const jobStatusLabel = jobStatus === 'complete' ? 'Complete' : jobStatus === 'pending' ? 'Pending' : titleCase(jobStatus);
-  const timestampLabel = timestamp ? String(timestamp).replace('T',' ').slice(0,16) : '';
+  const jobStatusLabel = jobStatus === 'complete' ? 'Complete' : jobStatus === 'pending' ? 'Pending' : jobStatus;
+
+  const tsLabel = timestamp ? String(timestamp).replace('T',' ').slice(0,16) : '';
 
   header.innerHTML = `
     <div class="summary-status">
@@ -292,7 +386,7 @@ function renderSummaryHeaderFromPayload(payload, context = {}){
       <span class="kv"><b>Errors:</b> <span>${counts.errors}</span></span>
       <span class="kv"><b>Warnings:</b> <span>${counts.warnings}</span></span>
       <span class="kv"><b>Info:</b> <span>${counts.infos}</span></span>
-      ${timestampLabel ? `<span class="timestamp">${escapeHtml(timestampLabel)}</span>` : ''}
+      ${tsLabel ? `<span class="timestamp">${escapeHtml(tsLabel)}</span>` : ''}
     </div>
     <div class="summary-meta">
       <span class="kv"><b>Job ID:</b> <span class="mono">${jobIdDisplay}</span></span>
@@ -303,15 +397,18 @@ function renderSummaryHeaderFromPayload(payload, context = {}){
     <div id="critical-chips" class="critical-chips"></div>
   `;
 
+  // Critical chips
   const chipsHost = document.getElementById('critical-chips');
   if (!chipsHost) return;
   chipsHost.replaceChildren();
-  const criticalSummary = Array.isArray(summary.criticalIssues) ? summary.criticalIssues : [];
-  const criticalFallback = Array.isArray(ws.criticalIssues) ? ws.criticalIssues : [];
-  const critical = criticalSummary.length ? criticalSummary : criticalFallback;
-  for (const issue of critical){
-    const label = titleCase(issue.type || 'critical issue');
-    const qty = issue.references?.length || issue.examples?.length || issue.count || '';
+
+  const critFromSummary = Array.isArray(summary.criticalIssues) ? summary.criticalIssues : [];
+  const critFromWs = Array.isArray(ws.criticalIssues) ? ws.criticalIssues : [];
+  const critical = critFromSummary.length ? critFromSummary : critFromWs;
+
+  for (const c of critical){
+    const label = String(c.type || 'Critical').replace(/_/g,' ');
+    const qty = c.references?.length || c.examples?.length || c.count || '';
     const chip = document.createElement('span');
     chip.className = 'critical-chip';
     chip.textContent = qty ? `${label} (${qty})` : label;
