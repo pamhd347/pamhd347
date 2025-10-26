@@ -1,0 +1,658 @@
+<!-- ===== RESULTS UI ===== -->
+
+<style>
+.validator-root{display:block;margin:16px 0}
+.section-title{margin:16px 0 8px;font-size:1.05rem;font-weight:600;color:#1f2937}
+
+.summary-header{display:flex;flex-direction:column;gap:10px;border:1px solid #e5e7eb;border-radius:10px;padding:12px;background:#fafafa}
+.summary-status{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.summary-meta{display:flex;flex-wrap:wrap;gap:12px;font-size:.92rem;color:#374151}
+.status-badge{display:inline-block;padding:.2rem .6rem;border-radius:999px;font-size:.8rem;border:1px solid transparent}
+.status-failed{background:#fee2e2;color:#7f1d1d;border-color:#fecaca}
+.status-passed{background:#e6ffed;color:#046b1a;border-color:#b7f5c4}
+.status-neutral{background:#f3f4f6;color:#374151;border-color:#d1d5db}
+.kv{display:flex;align-items:center;gap:4px}
+.kv b{color:#111827}
+.timestamp{margin-left:auto;color:#6b7280;font-size:.85rem}
+.critical-chips{display:flex;flex-wrap:wrap;gap:6px}
+.critical-chip{background:#fff3cd;border:1px solid #ffe08a;color:#7a5b00;border-radius:999px;padding:.15rem .5rem;font-size:.78rem}
+
+.rules-section{margin-top:18px}
+.rules-list{display:flex;flex-direction:column;gap:8px}
+.rule-card{border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;background:#fff}
+.rule-head{display:flex;align-items:center;gap:10px;padding:10px;cursor:pointer}
+.rule-id{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace;font-size:.9rem;color:#111827;background:#f3f4f6;border:1px solid #e5e7eb;padding:.1rem .4rem;border-radius:6px}
+.rule-meta{display:flex;gap:10px;font-size:.9rem;color:#374151}
+.rule-meta .count{display:inline-flex;gap:4px;align-items:center}
+.rule-toggle{margin-left:auto;font-size:.9rem;color:#2563eb;background:none;border:none;padding:0;cursor:pointer}
+.rule-body{display:none;padding:10px;border-top:1px solid #f3f4f6;background:#fcfcfc}
+.rule-body.open{display:block}
+
+.issue{display:flex;gap:8px;align-items:flex-start;padding:6px 0;border-bottom:1px dashed #eee}
+.issue:last-child{border-bottom:none}
+.issue .sev{font-weight:700;font-size:.8rem}
+.sev-error{color:#7f1d1d}
+.sev-warning{color:#92400e}
+.sev-info{color:#1f4b91}
+.issue .text{font-size:.92rem;color:#374151}
+.issue .hint{font-size:.85rem;color:#6b7280}
+
+.ai-section{margin-top:18px}
+.ai-box{border:1px dashed #d1d5db;border-radius:10px;padding:12px;background:#f9fafb;white-space:pre-wrap}
+.muted{color:#6b7280}
+.meta-grid{display:flex;flex-direction:column;gap:6px;font-size:.92rem;color:#374151}
+.meta-grid .kv b{min-width:120px}
+
+.result-badge{display:inline-block;padding:.15rem .5rem;border-radius:999px;font-size:.8rem}
+.badge-pending{background:#fff3cd;color:#856404;border:1px solid #ffeeba}
+.badge-complete{background:#e6ffed;color:#046b1a;border:1px solid #b7f5c4}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+.smallmuted{color:#6b7280;font-size:.85rem}
+.actions{display:flex;gap:.5rem;margin-top:8px}
+button.btn{border:1px solid #d1d5db;background:#fff;border-radius:8px;padding:6px 10px;cursor:pointer}
+pre.pretty{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px;max-height:320px;overflow:auto}
+@media (max-width:800px){.summary-status{flex-direction:column;align-items:flex-start}.summary-meta{flex-direction:column}}
+</style>
+
+<section id="results" style="margin:2rem 0;">
+  <h2>Results</h2>
+  <p id="results-status">Upload your spreadsheets to begin. No job running.</p>
+  <div id="results-body" style="border:1px solid #ddd;padding:1rem;border-radius:8px;min-height:120px;white-space:pre-wrap;"></div>
+
+  <!-- Optional manual starter for testing -->
+  <div style="margin-top:1rem;display:flex;gap:.5rem;align-items:center;">
+    <input id="manual-jobid" type="text" placeholder="Enter job_id to test polling…" style="flex:1;padding:.5rem;">
+    <button id="manual-start" type="button" style="padding:.5rem 1rem;">Start Polling</button>
+  </div>
+</section>
+
+<script>
+/* -------------------- STATE -------------------- */
+let jobId = null;
+let pollTimer = null;
+let pollDeadline = null;
+let isPolling = false;
+
+/* -------------------- CONFIG -------------------- */
+const RESULTS_API_BASE = 'https://makermind.app.n8n.cloud/webhook/validata/results';
+const ALLOWED_MESSAGE_ORIGINS = Object.freeze([
+  window.location.origin,
+]);
+
+/* -------------------- HELPERS -------------------- */
+function $(id){ return document.getElementById(id); }
+function renderStatus(msg){ const el = $('results-status'); if (el) el.textContent = msg; }
+function text(v){ return (v===null||v===undefined||v==='')?'—':String(v); }
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, (m) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m])); }
+function titleCase(str){ return String(str || '').toLowerCase().replace(/(^|_|-)([a-z])/g, (_,p,chr)=> (p? ' ':'') + chr.toUpperCase()); }
+
+async function copyToClipboard(textToCopy){
+  try {
+    await navigator.clipboard.writeText(textToCopy);
+    alert('Raw JSON copied to clipboard.');
+  } catch (e) {
+    console.error('Copy failed:', e);
+    alert('Copy failed.');
+  }
+}
+
+function downloadJson(filename, data){
+  const blob = new Blob([data], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function summarizeResults(payload){
+  const res = payload?.results ?? payload;
+  const summary = { tasks:0, parts:0, errors:0, warnings:0, infos:0 };
+  const excel = payload?.excel;
+  if (excel) {
+    summary.errors   += (excel.errors?.length || 0);
+    summary.warnings += (excel.warnings?.length || 0);
+    summary.infos    += (excel.info?.length || 0);
+  }
+  const websiteSummary = payload?.websiteSummary;
+  if (websiteSummary) {
+    summary.errors   += (websiteSummary.totalErrors || 0);
+    summary.warnings += (websiteSummary.totalWarnings || 0);
+    summary.infos    += (websiteSummary.totalInfo || 0);
+    if (websiteSummary.maintenance?.totalRows) summary.tasks += websiteSummary.maintenance.totalRows;
+    if (websiteSummary.spares?.totalRows)      summary.parts += websiteSummary.spares.totalRows;
+  }
+  const scan = (obj)=>{
+    if (!obj || typeof obj!=='object') return;
+    Object.entries(obj).forEach(([k,v])=>{
+      if (Array.isArray(v)) {
+        if (/error/i.test(k))   summary.errors+=v.length;
+        if (/warn/i.test(k))    summary.warnings+=v.length;
+        if (/info/i.test(k))    summary.infos+=v.length;
+      } else if (v && typeof v==='object') scan(v);
+    });
+  };
+  scan(res);
+  return summary;
+}
+
+// Normalise payload -> a single "ws" object with maintenance/spares/oem etc.
+function getWS(payload){
+  // Prefer explicit websiteSummary
+  if (payload && payload.websiteSummary) return payload.websiteSummary;
+
+  // If results is an array, use the first element
+  if (Array.isArray(payload?.results) && payload.results.length) {
+    const first = payload.results[0];
+    // Some shapes nest websiteSummary again
+    return first.websiteSummary ? first.websiteSummary : first;
+  }
+
+  // If results is an object, use it
+  if (payload && payload.results && typeof payload.results === 'object' && !Array.isArray(payload.results)) {
+    return payload.results.websiteSummary ? payload.results.websiteSummary : payload.results;
+  }
+
+  // Fallback: payload itself
+  return payload || {};
+}
+
+/* -------------------- RULE UI HELPERS -------------------- */
+// Robustly collect all issues anywhere in the payload.
+// Looks in websiteSummary/results first, then falls back to a deep scan.
+function extractAllIssues(payload){
+  const issues = [];
+
+  // 1) Prefer the normalised WS object if present
+  const ws = getWS(payload) || {};
+  const primaryBuckets = [
+    ws.maintenance,
+    ws.spares,
+    ws.oem,
+    ws.crossReference?.taskValidation,
+    ws.crossReference?.partValidation,
+  ].filter(Boolean);
+
+  for (const bucket of primaryBuckets){
+    for (const key of ['errors','warnings','info']){
+      const arr = Array.isArray(bucket?.[key]) ? bucket[key] : [];
+      for (const it of arr){
+        issues.push({
+          ruleId: it.ruleId || 'UNKNOWN_RULE',
+          severity: (it.severity || key || 'info').toUpperCase(),
+          sheet: it.sheet || bucket.sheet || '',
+          row: it.row ?? '',
+          column: it.column ?? '',
+          issue: it.issue || it.message || '',
+          suggestedFix: it.suggestedFix || ''
+        });
+      }
+    }
+  }
+
+  // detailedErrors at the same level as maintenance/spares
+  if (Array.isArray(ws.detailedErrors)) {
+    for (const it of ws.detailedErrors){
+      issues.push({
+        ruleId: it.ruleId || 'UNKNOWN_RULE',
+        severity: (it.severity || 'info').toUpperCase(),
+        sheet: it.sheet || '',
+        row: it.row ?? '',
+        column: it.column ?? '',
+        issue: it.issue || it.message || '',
+        suggestedFix: it.suggestedFix || ''
+      });
+    }
+  }
+
+  // 2) If nothing found, do a deep scan over the entire payload.
+  if (issues.length === 0){
+    const seen = new WeakSet();
+    (function walk(node){
+      if (!node || typeof node !== 'object' || seen.has(node)) return;
+      seen.add(node);
+
+      // If this object looks like an issue, capture it.
+      const looksLikeIssue =
+        (typeof node.issue === 'string' || typeof node.message === 'string') &&
+        (node.ruleId || node.severity || node.sheet || node.row !== undefined || node.column !== undefined);
+
+      if (looksLikeIssue){
+        issues.push({
+          ruleId: node.ruleId || 'UNKNOWN_RULE',
+          severity: String(node.severity || 'info').toUpperCase(),
+          sheet: node.sheet || '',
+          row: node.row ?? '',
+          column: node.column ?? '',
+          issue: node.issue || node.message || '',
+          suggestedFix: node.suggestedFix || ''
+        });
+      }
+
+      // If this object has arrays called errors/warnings/info, pull those too.
+      for (const key of ['errors','warnings','info']){
+        if (Array.isArray(node[key])){
+          for (const it of node[key]){
+            if (it && typeof it === 'object'){
+              issues.push({
+                ruleId: it.ruleId || 'UNKNOWN_RULE',
+                severity: (it.severity || key || 'info').toUpperCase(),
+                sheet: it.sheet || node.sheet || '',
+                row: it.row ?? '',
+                column: it.column ?? '',
+                issue: it.issue || it.message || '',
+                suggestedFix: it.suggestedFix || ''
+              });
+            }
+          }
+        }
+      }
+
+      // Recurse
+      for (const v of Object.values(node)){
+        if (v && typeof v === 'object') walk(v);
+      }
+    })(payload);
+  }
+
+  // Debug log to confirm what we’re seeing (safe to leave or delete later)
+  console.log('extractAllIssues: found', issues.length, 'issues');
+  return issues;
+}
+
+function groupIssuesByRule(issues){
+  const map = new Map();
+  for (const it of issues){
+    const key = it.ruleId || 'UNKNOWN_RULE';
+    if (!map.has(key)) {
+      map.set(key, { ruleId: key, errors:0, warnings:0, info:0, samples: [] });
+    }
+    const entry = map.get(key);
+    if (it.severity === 'ERROR') entry.errors++;
+    else if (it.severity === 'WARNING') entry.warnings++;
+    else entry.info++;
+    if (entry.samples.length < 5) entry.samples.push(it);
+  }
+  return map;
+}
+
+function renderRuleCards(ruleMap){
+  const host = document.getElementById('rules-list');
+  if (!host) return;
+  host.innerHTML = '';
+
+  if (ruleMap.size === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'muted';
+    empty.textContent = 'No rule violations detected.';
+    host.appendChild(empty);
+    return;
+  }
+
+  const makeIssueRow = (it) => {
+    const sevClass = it.severity === 'ERROR' ? 'sev-error' :
+                     it.severity === 'WARNING' ? 'sev-warning' : 'sev-info';
+    const where = [it.sheet, it.row ? `Row ${it.row}` : '', it.column].filter(Boolean).join(' · ');
+    const hint = it.suggestedFix ? `<div class="hint">Suggestion: ${escapeHtml(it.suggestedFix)}</div>` : '';
+    return `
+      <div class="issue">
+        <span class="sev ${sevClass}">${it.severity === 'ERROR' ? '❌' : it.severity === 'WARNING' ? '⚠️' : 'ℹ️'}</span>
+        <div class="text">
+          <div>${escapeHtml(it.issue || '')}</div>
+          <div class="hint">${escapeHtml(where || 'Location unknown')}</div>
+          ${hint}
+        </div>
+      </div>
+    `;
+  };
+
+  const entries = Array.from(ruleMap.values()).sort((a,b)=>{
+    const score = (entry) => (entry.errors * 100) + (entry.warnings * 10) + entry.info;
+    return score(b) - score(a);
+  });
+
+  for (const rule of entries){
+    const card = document.createElement('div');
+    card.className = 'rule-card';
+    card.innerHTML = `
+      <div class="rule-head">
+        <span class="rule-id">${escapeHtml(rule.ruleId)}</span>
+        <div class="rule-meta">
+          <span class="count">❌ <b>${rule.errors}</b></span>
+          <span class="count">⚠️ <b>${rule.warnings}</b></span>
+          <span class="count">ℹ️ <b>${rule.info}</b></span>
+        </div>
+        <button class="rule-toggle" type="button">Show</button>
+      </div>
+      <div class="rule-body">
+        ${rule.samples.length ? rule.samples.map(makeIssueRow).join('') : '<div class="muted">No sample rows available.</div>'}
+        <div class="hint" style="margin-top:6px;">Showing up to 5 examples per rule.</div>
+      </div>
+    `;
+
+    const head = card.querySelector('.rule-head');
+    const btn = card.querySelector('.rule-toggle');
+    const body = card.querySelector('.rule-body');
+    const toggle = () => {
+      const open = body.classList.toggle('open');
+      btn.textContent = open ? 'Hide' : 'Show';
+    };
+    head.addEventListener('click', toggle);
+    btn.addEventListener('click', (event)=>{ event.stopPropagation(); toggle(); });
+
+    host.appendChild(card);
+  }
+}
+
+function renderSummaryHeaderFromPayload(payload, context = {}){
+  const header = document.getElementById('summary-header');
+  if (!header) return;
+
+  const ws = getWS(payload) || {};
+  const summary = ws.summary || {};
+  const counts = context.summaryCounts || summarizeResults(payload);
+
+  const overall = String(summary.overallStatus || ws.overallStatus || summary.status || '—').toUpperCase();
+  const jobStatus = context.jobStatus || 'pending';
+  const jobIdDisplay = context.jobId ? escapeHtml(context.jobId) : 'unknown';
+  const timestamp = summary.timestamp || ws.timestamp || payload.timestamp || '';
+
+  const checkedTasks = summary.checkedTasks
+    ?? summary.totalTasksChecked
+    ?? ws.crossReference?.taskValidation?.totalChecked
+    ?? null;
+
+  const checkedParts = summary.checkedParts
+    ?? summary.totalPartsChecked
+    ?? ws.crossReference?.partValidation?.totalChecked
+    ?? null;
+
+  const statusBadge = overall === 'FAILED'
+    ? '<span class="status-badge status-failed">FAILED</span>'
+    : (overall === 'PASSED' || overall === 'PASSED_WITH_WARNINGS')
+      ? '<span class="status-badge status-passed">PASSED</span>'
+      : `<span class="status-badge status-neutral">${escapeHtml(overall)}</span>`;
+
+  const jobStatusLabel = jobStatus === 'complete' ? 'Complete' : jobStatus === 'pending' ? 'Pending' : jobStatus;
+
+  const tsLabel = timestamp ? String(timestamp).replace('T',' ').slice(0,16) : '';
+
+  header.innerHTML = `
+    <div class="summary-status">
+      ${statusBadge}
+      <span class="kv"><b>Errors:</b> <span>${counts.errors}</span></span>
+      <span class="kv"><b>Warnings:</b> <span>${counts.warnings}</span></span>
+      <span class="kv"><b>Info:</b> <span>${counts.infos}</span></span>
+      ${tsLabel ? `<span class="timestamp">${escapeHtml(tsLabel)}</span>` : ''}
+    </div>
+    <div class="summary-meta">
+      <span class="kv"><b>Job ID:</b> <span class="mono">${jobIdDisplay}</span></span>
+      <span class="kv"><b>Job status:</b> <span>${escapeHtml(jobStatusLabel)}</span></span>
+      ${checkedTasks != null ? `<span class="kv"><b>Checked tasks:</b> <span>${checkedTasks}</span></span>` : ''}
+      ${checkedParts != null ? `<span class="kv"><b>Checked parts:</b> <span>${checkedParts}</span></span>` : ''}
+    </div>
+    <div id="critical-chips" class="critical-chips"></div>
+  `;
+
+  // Critical chips
+  const chipsHost = document.getElementById('critical-chips');
+  if (!chipsHost) return;
+  chipsHost.replaceChildren();
+
+  const critFromSummary = Array.isArray(summary.criticalIssues) ? summary.criticalIssues : [];
+  const critFromWs = Array.isArray(ws.criticalIssues) ? ws.criticalIssues : [];
+  const critical = critFromSummary.length ? critFromSummary : critFromWs;
+
+  for (const c of critical){
+    const label = String(c.type || 'Critical').replace(/_/g,' ');
+    const qty = c.references?.length || c.examples?.length || c.count || '';
+    const chip = document.createElement('span');
+    chip.className = 'critical-chip';
+    chip.textContent = qty ? `${label} (${qty})` : label;
+    chipsHost.appendChild(chip);
+  }
+}
+
+function renderMetadataSection(metadata, context = {}){
+  const host = document.getElementById('metadata-grid');
+  if (!host) return;
+
+  const rows = [];
+  if (metadata) {
+    rows.push({ label: 'Started', value: text(metadata.startedAt) });
+    rows.push({ label: 'Finished', value: text(metadata.finishedAt) });
+    rows.push({ label: 'Runtime', value: text(metadata.runtime) });
+  }
+  if (context.jobStatus) {
+    rows.push({ label: 'Polling status', value: titleCase(context.jobStatus) });
+  }
+  if (context.apiStatus) {
+    rows.push({ label: 'API status', value: titleCase(context.apiStatus) });
+  }
+
+  if (!rows.length) {
+    host.classList.add('muted');
+    host.textContent = 'No execution metadata provided.';
+    return;
+  }
+
+  host.classList.remove('muted');
+  host.innerHTML = rows.map(({label, value}) => `
+    <div class="kv"><b>${escapeHtml(label)}:</b> <span>${escapeHtml(value)}</span></div>
+  `).join('');
+}
+
+function setAiBoxContent(elementId, content, fallback){
+  const box = document.getElementById(elementId);
+  if (!box) return;
+  if (content) {
+    box.classList.remove('muted');
+    box.textContent = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+  } else {
+    box.classList.add('muted');
+    box.textContent = fallback;
+  }
+}
+
+function renderResultsPayload(payload){
+  const out = document.getElementById('results-body');
+  if (!out) return;
+
+  const job = payload.job_id || payload?.results?.job_id || 'unknown';
+  const rawStatus = (payload.status || (payload.ok === true ? 'complete' : ''));
+  const hasAnyResults =
+    (Array.isArray(payload.results) && payload.results.length > 0) ||
+    (payload.results && typeof payload.results === 'object' && !Array.isArray(payload.results) && Object.keys(payload.results).length > 0) ||
+    !!payload.websiteSummary || !!payload.excel || !!payload.ai;
+
+  const jobStatus = String(rawStatus || (hasAnyResults ? 'complete' : 'pending')).toLowerCase();
+  const summaryCounts = summarizeResults(payload);
+  const ws = payload.websiteSummary || {};
+  const meta = payload.metadata || null;
+  const aiSummary = ws.summary?.aiSummary || payload.aiSummary || null;
+  const aiReview = ws.summary?.aiReview || payload.aiReview || null;
+
+  const rawJson = JSON.stringify(payload, null, 2);
+
+  out.innerHTML = `
+    <!-- ===== VALIDATOR RESULTS ===== -->
+    <section id="validator-root" class="validator-root">
+      <header id="summary-header" class="summary-header"></header>
+
+      <section id="rules-section" class="rules-section">
+        <h3 class="section-title">Rules</h3>
+        <div id="rules-list" class="rules-list"></div>
+      </section>
+
+      <section id="ai-summary" class="ai-section">
+        <h3 class="section-title">AI Summary</h3>
+        <div id="ai-summary-box" class="ai-box muted">AI Summary will appear here (high-level, 3–5 bullets).</div>
+      </section>
+
+      <section id="ai-review" class="ai-section">
+        <h3 class="section-title">AI Review</h3>
+        <div id="ai-review-box" class="ai-box muted">AI Review will appear here (narrative findings + suggested next actions).</div>
+      </section>
+
+      <section id="execution-metadata" class="ai-section">
+        <h3 class="section-title">Execution Metadata</h3>
+        <div id="metadata-grid" class="meta-grid muted">No execution metadata provided.</div>
+      </section>
+
+      <section id="raw-results" class="ai-section">
+        <h3 class="section-title">Raw Payload</h3>
+        <pre id="raw-json" class="pretty mono"></pre>
+        <div class="actions">
+          <button class="btn" type="button" id="copy-json">Copy JSON</button>
+          <button class="btn" type="button" id="download-json">Download JSON</button>
+        </div>
+      </section>
+    </section>
+    <!-- ===== END VALIDATOR RESULTS ===== -->
+  `;
+
+  renderSummaryHeaderFromPayload(payload, {
+    jobId: job,
+    jobStatus,
+    summaryCounts,
+  });
+
+  const allIssues = extractAllIssues(payload);
+  const byRule = groupIssuesByRule(allIssues);
+  renderRuleCards(byRule);
+
+  setAiBoxContent('ai-summary-box', aiSummary, 'AI Summary will appear here (high-level, 3–5 bullets).');
+  setAiBoxContent('ai-review-box', aiReview, 'AI Review will appear here (narrative findings + suggested next actions).');
+  renderMetadataSection(meta, { jobStatus, apiStatus: rawStatus });
+
+  const rawJsonEl = document.getElementById('raw-json');
+  if (rawJsonEl) rawJsonEl.textContent = rawJson;
+
+  const copyBtn = document.getElementById('copy-json');
+  copyBtn?.addEventListener('click', () => copyToClipboard(rawJson));
+
+  const downloadBtn = document.getElementById('download-json');
+  downloadBtn?.addEventListener('click', () => downloadJson(`validata-results-${job}.json`, rawJson));
+}
+
+function clearPolling(){
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null;
+  pollDeadline = null;
+  isPolling = false;
+}
+
+async function fetchJsonSafely(url, options){
+  const res = await fetch(url, { cache: 'no-store', ...options });
+  const bodyText = await res.text();
+  let data = null;
+  try { data = JSON.parse(bodyText); } catch {}
+  return { ok: res.ok, status: res.status, text: bodyText, data };
+}
+
+/* -------------------- CORE -------------------- */
+function startPolling(receivedJobId){
+  if (!receivedJobId || typeof receivedJobId !== 'string') {
+    console.warn('startPolling called without a valid job_id:', receivedJobId);
+    return;
+  }
+  if (isPolling && receivedJobId === jobId) {
+    console.log('Already polling this job:', jobId);
+    return;
+  }
+
+  clearPolling();
+
+  jobId = receivedJobId;
+  isPolling = true;
+  renderStatus(`Job detected: ${jobId} — polling for results…`);
+
+  pollDeadline = Date.now() + 5 * 60 * 1000;
+
+  pollTimer = setInterval(async () => {
+    if (Date.now() > pollDeadline) {
+      clearPolling();
+      renderStatus('No results found within 5 minutes.');
+      sessionStorage.removeItem('validation_job_id');
+      return;
+    }
+
+    try {
+      const url = `${RESULTS_API_BASE}?job_id=${encodeURIComponent(jobId)}&t=${Date.now()}`;
+      const { ok, status, data } = await fetchJsonSafely(url, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' }
+      });
+
+      console.log('Polling response:', { ok, status, data });
+
+      if (!ok || !data || data.job_id !== jobId) return;
+
+      const statusStr = String(data.status || '').toLowerCase();
+      const isComplete = statusStr === 'complete' || data.ok === true;
+
+      const hasResultsArray = Array.isArray(data.results) && data.results.length > 0;
+      const hasResultsObj = !!(data.results && typeof data.results === 'object' && !Array.isArray(data.results) && Object.keys(data.results).length > 0);
+
+      if (hasResultsArray || hasResultsObj) {
+        clearPolling();
+        renderStatus(`Results ready for ${jobId}.`);
+        renderResultsPayload(data);
+        sessionStorage.removeItem('validation_job_id');
+      } else if (isComplete) {
+        clearPolling();
+        renderStatus(`Results ready for ${jobId} (no issues reported).`);
+        renderResultsPayload(data);
+        sessionStorage.removeItem('validation_job_id');
+      }
+    } catch (err) {
+      console.error('Polling error:', err);
+    }
+  }, 3000);
+}
+
+/* -------------------- WIRING -------------------- */
+document.addEventListener('DOMContentLoaded', () => {
+  renderStatus('Upload your spreadsheets to begin. No job running.');
+
+  try {
+    sessionStorage.removeItem('validation_job_id');
+    const url = new URL(window.location.href);
+    if (url.searchParams.has('job_id')) {
+      url.searchParams.delete('job_id');
+      window.history.replaceState({}, '', url.toString());
+    }
+  } catch {}
+
+  window.addEventListener('message', (event) => {
+    if (!ALLOWED_MESSAGE_ORIGINS.includes(event.origin)) {
+      console.warn('Ignoring message from unexpected origin:', event.origin);
+      return;
+    }
+    if (event?.data?.type === 'validation_job' && event.data.job_id) {
+      console.log('Received fresh job_id via postMessage:', event.data.job_id);
+      sessionStorage.setItem('validation_job_id', event.data.job_id);
+      startPolling(event.data.job_id);
+    }
+  });
+
+  const btn = document.getElementById('manual-start');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      const entered = (document.getElementById('manual-jobid')?.value || '').trim();
+      if (!entered) {
+        renderStatus('Enter a job_id to start polling.');
+        return;
+      }
+      sessionStorage.setItem('validation_job_id', entered);
+      startPolling(entered);
+    });
+  }
+});
+
+/* -------------------- PUBLIC HOOK -------------------- */
+window.Validata = { startWithJob: (jid) => startPolling(jid) };
+</script>
